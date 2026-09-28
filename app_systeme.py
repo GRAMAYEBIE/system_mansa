@@ -1,5 +1,5 @@
 """
-Vue Système J+1 — Mansa Bank
+Vue Système J+1 — Mansa Bank (Autonome)
 Source de données : Google Sheets (Onglet: brut)
 """
 
@@ -9,17 +9,24 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-
-import config
-from kobo_client import load_enrollment_data
 
 st.set_page_config(page_title="Vue Système J+1 — Mansa Bank", page_icon="⚙️", layout="wide")
 
 # =============================================================================
-# CHARTE GRAPHIQUE & STYLES (Mansa Bank Theme)
+# CONFIGURATION & VARIABLES PAR DÉFAUT
 # =============================================================================
+AUTO_RELOAD_MS = 300000  # 5 minutes
+GOOGLE_SHEET_ID = "1ukz_C93NfaaPPyJKyNHeIzM3iQ1GwDOZemub_D_uWKA"
+SHEET_GID = "1100180919"  # Onglet 'brut'
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+
+# URL Kobo Form Enrôlement
+KOBO_ENROLLMENT_URL = "https://kf.kobotoolbox.org/api/v2/assets/aAUn3mJ59PzY2YQAnpX42S/data.json"
+
+# Charte Graphique Mansa Bank
 T = {
     "bg": "#F6F7FB",
     "card_bg": "#FFFFFF",
@@ -50,49 +57,62 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =============================================================================
-# CONNEXION GOOGLE SHEETS & DATA RETRIEVAL
-# =============================================================================
-GOOGLE_SHEET_ID = "1ukz_C93NfaaPPyJKyNHeIzM3iQ1GwDOZemub_D_uWKA"
-SHEET_GID = "1100180919"  # GID de l'onglet 'brut'
-SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+st_autorefresh(interval=AUTO_RELOAD_MS, key="auto_reload_sys")
 
-st_autorefresh(interval=config.AUTO_RELOAD_MS, key="auto_reload_sys")
-
-@st.cache_data(ttl=300) # Rafraîchissement automatique toutes les 5 minutes
+# =============================================================================
+# CHARGEMENT DES DONNÉES
+# =============================================================================
+@st.cache_data(ttl=300)
 def load_sheet_brut():
     try:
         df_sheet = pd.read_csv(SHEET_URL)
         return df_sheet
     except Exception as e:
-        st.error(f"Erreur lors du chargement de la feuille Google Sheet : {e}")
+        st.error(f"Erreur de chargement Google Sheet : {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=config.REFRESH_INTERVAL_SECONDS)
-def get_enrollment_data(force: bool):
-    return load_enrollment_data(force_refresh=force)
+@st.cache_data(ttl=300)
+def load_enrollment_data():
+    try:
+        headers = {"Authorization": "Token 309d43509b55dbfa0f3a61bbccceae6cfdaebc42"}
+        res = requests.get(KOBO_ENROLLMENT_URL, headers=headers, timeout=10)
+        if res.status_code == 200:
+            results = res.json().get("results", [])
+            df = pd.DataFrame(results)
+            # Nettoyage des colonnes Kobo
+            code_col = next((c for c in df.columns if "code" in c.lower()), None)
+            name_col = next((c for c in df.columns if "nom" in c.lower() or "prenom" in c.lower()), None)
+            team_col = next((c for c in df.columns if "equipe" in c.lower() or "team" in c.lower()), None)
+            role_col = next((c for c in df.columns if "role" in c.lower() or "fonction" in c.lower()), None)
+            
+            res_df = pd.DataFrame()
+            res_df["code_parrainage"] = df[code_col].astype(str).str.strip().str.upper() if code_col else ""
+            res_df["nom_prenoms"] = df[name_col] if name_col else ""
+            res_df["equipe"] = df[team_col] if team_col else "Non assignée"
+            res_df["role"] = df[role_col] if role_col else "Commercial"
+            return res_df
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
-# Chargement initial
 df_raw = load_sheet_brut()
-enr_df, _ = get_enrollment_data(False)
+enr_df = load_enrollment_data()
 
 if df_raw.empty:
-    st.warning("⚠️ Aucune donnée disponible ou accessible dans l'onglet 'brut' de Google Sheets.")
+    st.warning("⚠️ Aucune donnée disponible dans l'onglet 'brut' de Google Sheets.")
     st.stop()
 
 # =============================================================================
-# NETTOYAGE & STRUCTURATION DES DONNÉES
+# PREPARATION ET TRAITEMENT
 # =============================================================================
 df = df_raw.copy()
 
-# Détection automatique ou dynamique des colonnes principales
 date_col = next((c for c in df.columns if any(k in c.lower() for k in ["date", "created", "time"])), None)
 code_col = next((c for c in df.columns if any(k in c.lower() for k in ["code", "parrainage", "agent"])), None)
 trans_col = next((c for c in df.columns if any(k in c.lower() for k in ["transaction", "trans", "statut", "status"])), None)
 wallet_col = next((c for c in df.columns if any(k in c.lower() for k in ["acquisition", "wallet", "offre", "type"])), None)
 equipe_col_raw = next((c for c in df.columns if "equipe" in c.lower() or "team" in c.lower()), None)
 
-# 1. Dates et calcul des semaines de parrainage
 if date_col:
     df["date_parsed"] = pd.to_datetime(df[date_col], errors="coerce")
     df["date_only"] = df["date_parsed"].dt.date
@@ -115,7 +135,6 @@ def get_parrainage_week(dt):
 
 df["semaine_parrainage"] = df["date_parsed"].apply(get_parrainage_week) if date_col else "N/A"
 
-# 2. Code Parrainage
 CODE_PATTERN = re.compile(r"^[0-9A-F]{6}$")
 
 def extract_code(val):
@@ -130,9 +149,7 @@ def extract_code(val):
 df["code_parrainage"] = df[code_col].apply(extract_code) if code_col else None
 df["code_display"] = df["code_parrainage"].fillna("Non identifié")
 
-# 3. Croisement avec le fichier Kobo (Équipes et Nom/Prénom)
 if not enr_df.empty:
-    enr_df["code_parrainage"] = enr_df["code_parrainage"].astype(str).str.strip().str.upper()
     is_sup = enr_df["role"].fillna("").str.lower().str.contains("superviseur", na=False)
     commerciaux_df = enr_df[~is_sup].drop_duplicates(subset="code_parrainage", keep="last")
     codes_enrolles = set(commerciaux_df["code_parrainage"].dropna().unique())
@@ -151,13 +168,11 @@ else:
     df["equipe"] = df[equipe_col_raw] if equipe_col_raw else "Non assignée"
     df["nom_prenoms"] = df["code_display"]
 
-# 4. Statut Transaction (True / False)
 if trans_col:
     df["transaction_bool"] = df[trans_col].astype(str).str.lower().str.contains("true|1|oui|success", na=False)
 else:
     df["transaction_bool"] = True
 
-# 5. Acquisition / Wallet (Wallet 1 / Wallet 2)
 if wallet_col:
     df["wallet_clean"] = df[wallet_col].astype(str).str.strip().str.upper()
     df["wallet_clean"] = df["wallet_clean"].apply(
@@ -212,14 +227,11 @@ if selected_code != "Tous":
     fdf = fdf[fdf["code_display"] == selected_code]
 
 # =============================================================================
-# EN-TÊTE
+# AFFICHAGE DASHBOARD
 # =============================================================================
 st.markdown("# ⚙️ Vue Système J+1 — Mansa Bank")
-st.caption(f"Données réelles (Google Sheet: **brut**) · Période sélectionnée : **{periode_opt}**")
+st.caption(f"Données réelles (Google Sheet: **brut**) · Période : **{periode_opt}**")
 
-# =============================================================================
-# 1. METRIQUES DE BASE (7 KPI)
-# =============================================================================
 codes_actifs = set(fdf["code_parrainage"].dropna().unique())
 codes_matches = codes_actifs & codes_enrolles
 codes_non_enrolles = codes_actifs - codes_enrolles
@@ -247,9 +259,6 @@ m5.metric("MEILLEURE ÉQUIPE", top_eq)
 m6.metric("MEILLEUR AGENT", best_agent_label)
 m7.metric("ACTIVATIONS TOTALES", len(fdf))
 
-# =============================================================================
-# 2. RÉPARTITION PAR ÉQUIPE, TRANSACTIONS & WALLETS (ACQUISITION)
-# =============================================================================
 st.markdown("<h3 class='section-title'>Répartition par Équipe & Acquisitions (Wallet 1 / Wallet 2)</h3>", unsafe_allow_html=True)
 
 if not fdf.empty:
@@ -287,11 +296,8 @@ if not fdf.empty:
             hide_index=True
         )
 else:
-    st.info("Aucune donnée système enregistrée pour les filtres appliqués.")
+    st.info("Aucune donnée disponible pour cette sélection.")
 
-# =============================================================================
-# 3. TOP 5 MEILLEURS AGENTS
-# =============================================================================
 st.markdown("<h3 class='section-title'>Top 5 Meilleurs Agents</h3>", unsafe_allow_html=True)
 top5 = (
     fdf.groupby(["code_display", "nom_prenoms"]).agg(
@@ -316,7 +322,3 @@ if not top5.empty:
                 </div>""",
                 unsafe_allow_html=True,
             )
-else:
-    st.caption("Aucun agent disponible sur cette sélection.")
-
-st.caption("Application Système J+1 — Mansa Bank · Synchronisé sur Google Sheets (onglet: brut).")
