@@ -1,6 +1,6 @@
 """
 Vue Système J+1 — Mansa Bank (Autonome)
-Source de données : Google Sheets (Onglet: brut)
+Source de données : Google Sheets (Onglet: Brut)
 """
 
 import re
@@ -20,8 +20,8 @@ st.set_page_config(page_title="Vue Système J+1 — Mansa Bank", page_icon="⚙�
 # =============================================================================
 AUTO_RELOAD_MS = 300000  # 5 minutes
 GOOGLE_SHEET_ID = "1ukz_C93NfaaPPyJKyNHeIzM3iQ1GwDOZemub_D_uWKA"
-SHEET_GID = "1100180919"  # Onglet 'brut'
-SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+# Connexion directe par le nom d'onglet 'Brut'
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Brut"
 
 # URL Kobo Form Enrôlement
 KOBO_ENROLLMENT_URL = "https://kf.kobotoolbox.org/api/v2/assets/aAUn3mJ59PzY2YQAnpX42S/data.json"
@@ -68,7 +68,7 @@ def load_sheet_brut():
         df_sheet = pd.read_csv(SHEET_URL)
         return df_sheet
     except Exception as e:
-        st.error(f"Erreur de chargement Google Sheet : {e}")
+        st.error(f"Erreur de chargement de la feuille Google Sheet (Onglet 'Brut') : {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
@@ -79,7 +79,7 @@ def load_enrollment_data():
         if res.status_code == 200:
             results = res.json().get("results", [])
             df = pd.DataFrame(results)
-            # Nettoyage des colonnes Kobo
+            
             code_col = next((c for c in df.columns if "code" in c.lower()), None)
             name_col = next((c for c in df.columns if "nom" in c.lower() or "prenom" in c.lower()), None)
             team_col = next((c for c in df.columns if "equipe" in c.lower() or "team" in c.lower()), None)
@@ -99,7 +99,7 @@ df_raw = load_sheet_brut()
 enr_df = load_enrollment_data()
 
 if df_raw.empty:
-    st.warning("⚠️ Aucune donnée disponible dans l'onglet 'brut' de Google Sheets.")
+    st.warning("⚠️ Aucune donnée disponible dans l'onglet 'Brut' de Google Sheets.")
     st.stop()
 
 # =============================================================================
@@ -113,6 +113,7 @@ trans_col = next((c for c in df.columns if any(k in c.lower() for k in ["transac
 wallet_col = next((c for c in df.columns if any(k in c.lower() for k in ["acquisition", "wallet", "offre", "type"])), None)
 equipe_col_raw = next((c for c in df.columns if "equipe" in c.lower() or "team" in c.lower()), None)
 
+# 1. Dates et calcul des semaines de parrainage
 if date_col:
     df["date_parsed"] = pd.to_datetime(df[date_col], errors="coerce")
     df["date_only"] = df["date_parsed"].dt.date
@@ -135,6 +136,7 @@ def get_parrainage_week(dt):
 
 df["semaine_parrainage"] = df["date_parsed"].apply(get_parrainage_week) if date_col else "N/A"
 
+# 2. Code Parrainage
 CODE_PATTERN = re.compile(r"^[0-9A-F]{6}$")
 
 def extract_code(val):
@@ -149,6 +151,7 @@ def extract_code(val):
 df["code_parrainage"] = df[code_col].apply(extract_code) if code_col else None
 df["code_display"] = df["code_parrainage"].fillna("Non identifié")
 
+# 3. Croisement Kobo
 if not enr_df.empty:
     is_sup = enr_df["role"].fillna("").str.lower().str.contains("superviseur", na=False)
     commerciaux_df = enr_df[~is_sup].drop_duplicates(subset="code_parrainage", keep="last")
@@ -168,11 +171,13 @@ else:
     df["equipe"] = df[equipe_col_raw] if equipe_col_raw else "Non assignée"
     df["nom_prenoms"] = df["code_display"]
 
+# 4. Statut Transaction
 if trans_col:
     df["transaction_bool"] = df[trans_col].astype(str).str.lower().str.contains("true|1|oui|success", na=False)
 else:
     df["transaction_bool"] = True
 
+# 5. Acquisition / Wallet
 if wallet_col:
     df["wallet_clean"] = df[wallet_col].astype(str).str.strip().str.upper()
     df["wallet_clean"] = df["wallet_clean"].apply(
@@ -230,7 +235,7 @@ if selected_code != "Tous":
 # AFFICHAGE DASHBOARD
 # =============================================================================
 st.markdown("# ⚙️ Vue Système J+1 — Mansa Bank")
-st.caption(f"Données réelles (Google Sheet: **brut**) · Période : **{periode_opt}**")
+st.caption(f"Données réelles (Google Sheet: **Brut**) · Période : **{periode_opt}**")
 
 codes_actifs = set(fdf["code_parrainage"].dropna().unique())
 codes_matches = codes_actifs & codes_enrolles
