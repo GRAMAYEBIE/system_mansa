@@ -142,13 +142,9 @@ def load_and_process_brut() -> pd.DataFrame:
     df["code_parrainage"] = df.get("code_parrainage", pd.Series(dtype=str)).fillna("Inconnu").astype(str).str.strip().str.upper()
     df["parrain_nom"] = df.get("parrain_nom", pd.Series(dtype=str)).fillna("Non renseigné").astype(str).str.strip()
 
-    # Parsing de date robuste : certaines lignes ajoutées automatiquement (Apps Script) peuvent
-    # sortir dans un format différent des saisies manuelles. On tente jour-premier puis mois-premier
-    # et on comble les trous de l'un avec l'autre, ligne par ligne.
+    # Format confirmé stable : jour/mois/année, jamais modifié par l'automatisation.
     raw_dates = df.get("date_parrainage", pd.Series(dtype=str)).astype(str).str.strip()
-    parsed_dayfirst = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
-    parsed_monthfirst = pd.to_datetime(raw_dates, errors="coerce", dayfirst=False)
-    df["date_parrainage_parsed"] = parsed_dayfirst.fillna(parsed_monthfirst)
+    df["date_parrainage_parsed"] = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
     df["date_only"] = df["date_parrainage_parsed"].dt.date
 
     df["is_true"] = df.get("a_transacte", pd.Series(dtype=str)).astype(str).str.strip().str.lower().eq("true")
