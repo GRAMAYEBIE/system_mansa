@@ -276,6 +276,27 @@ def _render_dashboard():
                 unsafe_allow_html=True,
             )
 
+        st.markdown("<h3 class='section-title'>📅 Activations & Acquisition par semaine</h3>", unsafe_allow_html=True)
+        st.caption("Indépendant du filtre Période ci-contre — respecte seulement l'Agence / le Code sélectionné, si filtré.")
+        weekly_scope = df
+        if selected_agence != "Toutes":
+            weekly_scope = weekly_scope[weekly_scope["agence"] == selected_agence]
+        if selected_code != "Tous":
+            weekly_scope = weekly_scope[weekly_scope["code_parrainage"] == selected_code]
+
+        weekly_rows = []
+        for label, s, e in all_weeks:
+            wk_df = weekly_scope[(weekly_scope["date_only"] >= s) & (weekly_scope["date_only"] <= e)]
+            weekly_rows.append({
+                "Semaine": f"{label} ({s:%d/%m} → {e:%d/%m})",
+                "Activations": int(wk_df["is_true"].sum()),
+                "Wallet 1": int(wk_df["is_wallet1"].sum()),
+                "Wallet 2": int(wk_df["is_wallet2"].sum()),
+            })
+        weekly_df = pd.DataFrame(weekly_rows)
+        st.dataframe(weekly_df, use_container_width=True, hide_index=True)
+        st.bar_chart(weekly_df.set_index("Semaine")[["Activations", "Wallet 1", "Wallet 2"]])
+
         st.markdown("<h3 class='section-title'>🏆 Top 5 des meilleurs agents</h3>", unsafe_allow_html=True)
         if activations_periode == 0:
             st.info("Aucune activation sur la période sélectionnée.")
