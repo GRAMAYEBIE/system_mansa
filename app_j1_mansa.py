@@ -2,7 +2,7 @@
 Vue Système J+1 — Mansa Bank
 ============================
 Source des activations : Google Sheets (onglet "Brut"), alimenté automatiquement par mail.
-Source de l'effectif AVD (Prévu / Déployé) : fichier Excel "base agents" DataSurvey Africa.
+Source de l'effectif AVD (Prévu) : Google Sheet "base agents activateurs" DataSurvey Africa.
 
 CONÇU POUR 100+ UTILISATEURS SIMULTANÉS :
 - Toutes les requêtes réseau passent par un cache PARTAGÉ (st.cache_data) : le Sheet
@@ -39,14 +39,18 @@ BRUT_TTL = 90  # secondes — fraîcheur des activations
 FETCH_TIMEOUT = 15  # secondes — au-delà, on abandonne cette tentative
 FETCH_RETRIES = 3
 
-# ⚠️ À VÉRIFIER : posez le fichier à côté de ce script et ajustez le chemin,
-# OU renseignez BASE_XLSX_URL (lien direct/raw) si le fichier est hébergé en ligne.
-BASE_XLSX_PATH = "BASE_DE_DONNEE_AGENTS_ACTIVATEURS_DATASURVEY_AFRICA.xlsx"
-BASE_XLSX_URL = ""
+# --- Base agents activateurs (AVD Prévu) — Google Sheet ---
+# Colonnes confirmées : date_soumission, start, end, code parrainage, numero the code,
+# nom et prenoms, role (commercial/superviseur), nom du superviseur, regions, ville, equipe.
+# On ne garde que role="commercial" (les vrais AVD terrain, pas les superviseurs).
+BASE_SHEET_ID = "1968llx0L-Eu-TSKfJKweFbfzag_i5a7SsSBWoB9I6Zc"
+BASE_SHEET_GID = "1616384377"
+BASE_CSV_URL = f"https://docs.google.com/spreadsheets/d/{BASE_SHEET_ID}/gviz/tq?tqx=out:csv&gid={BASE_SHEET_GID}"
 BASE_TTL = 3600
 
-# ⚠️ À VÉRIFIER : nom de la colonne code agent dans le fichier de base (détection auto par mot-clé).
-BASE_CODE_KEYWORDS = ["code"]
+BASE_CODE_KEYWORDS = ["code"]  # capte "code parrainage" (1ère colonne "code" du fichier)
+BASE_ROLE_KEYWORDS = ["role"]
+BASE_ROLE_FILTER = "commercial"  # ne compter que les AVD terrain, pas les superviseurs
 
 # --- Définition des "semaines" (cycle dynamique, ne nécessite aucune maintenance) ---
 FIRST_WEEK_START = date(2026, 8, 15)
@@ -65,6 +69,19 @@ def get_week_bounds(ref_date: date) -> tuple[date, date]:
 def get_previous_week_bounds(ref_date: date) -> tuple[date, date]:
     this_start, _ = get_week_bounds(ref_date)
     return get_week_bounds(this_start - timedelta(days=1))
+
+
+def get_all_weeks(ref_date: date) -> list[tuple[str, date, date]]:
+    """Liste (label, début, fin) de la Semaine 1 (15→23 août) jusqu'à la semaine
+    contenant ref_date (aujourd'hui), générée dynamiquement — jamais besoin de la retoucher."""
+    weeks = [("Semaine 1", FIRST_WEEK_START, FIRST_WEEK_END)]
+    n = 2
+    start = REGULAR_WEEK_START
+    while start <= ref_date:
+        weeks.append((f"Semaine {n}", start, start + timedelta(days=6)))
+        start += timedelta(days=7)
+        n += 1
+    return weeks
 
 
 # ============================================================================
@@ -179,8 +196,7 @@ def load_base_avd() -> dict:
     """AVD Prévu = tous les agents de la base. AVD Déployé = ceux, parmi eux, qui ont
     fait au moins une activation sur la période sélectionnée (calculé plus loin)."""
     try:
-        source = BASE_XLSX_URL if BASE_XLSX_URL else BASE_XLSX_PATH
-        base_df = pd.read_excel(source)
+        base_df = _fetch_csv_with_retries(BASE_CSV_URL)
     except Exception:
         return {"codes": set(), "ok": False}
 
@@ -188,6 +204,11 @@ def load_base_avd() -> dict:
     code_col = _find_col(base_df.columns, BASE_CODE_KEYWORDS)
     if not code_col:
         return {"codes": set(), "ok": False}
+
+    role_col = _find_col(base_df.columns, BASE_ROLE_KEYWORDS)
+    if role_col:
+        role_norm = base_df[role_col].astype(str).str.strip().str.lower()
+        base_df = base_df[role_norm.str.contains(BASE_ROLE_FILTER, na=False)]
 
     codes = set(base_df[code_col].dropna().astype(str).str.strip().str.upper())
     codes.discard("")
@@ -224,18 +245,30 @@ def _render_dashboard():
         yesterday_utc = today_utc - timedelta(days=1)
         week_start, week_end = get_week_bounds(today_utc)
         prev_week_start, prev_week_end = get_previous_week_bounds(today_utc)
+        all_weeks = get_all_weeks(today_utc)  # [(label, début, fin), ...] Semaine 1 → semaine en cours
 
         with st.sidebar:
             st.markdown("### ⚡ Filtres")
             option_periode = st.radio(
                 "Période (basée sur la date de parrainage) :",
-                options=["Hier", "Cette semaine", "Semaine passée"],
+                options=["Hier", "Cette semaine", "Semaine passée", "Choisir une semaine"],
                 index=0,
                 key="option_periode",
             )
             st.caption(f"Hier : {yesterday_utc:%d/%m}")
             st.caption(f"Cette semaine : {week_start:%d/%m} → {week_end:%d/%m}")
             st.caption(f"Semaine passée : {prev_week_start:%d/%m} → {prev_week_end:%d/%m}")
+
+            chosen_week_start, chosen_week_end = week_start, week_end
+            if option_periode == "Choisir une semaine":
+                week_labels = [f"{label} ({s:%d/%m} → {e:%d/%m})" for label, s, e in all_weeks]
+                chosen_label = st.selectbox(
+                    "Semaine :", options=week_labels, index=len(week_labels) - 1, key="week_choice"
+                )
+                chosen_week_start, chosen_week_end = next(
+                    (s, e) for (label, s, e), full in zip(all_weeks, week_labels) if full == chosen_label
+                )
+
             st.markdown("---")
             agences_list = ["Toutes"] + sorted(df["agence"].unique().tolist())
             selected_agence = st.selectbox("Filtrer par Agence / Équipe :", options=agences_list, key="agence_filter")
@@ -254,14 +287,17 @@ def _render_dashboard():
             fdf = fdf[(fdf["date_only"] >= week_start) & (fdf["date_only"] <= week_end)]
         elif option_periode == "Semaine passée":
             fdf = fdf[(fdf["date_only"] >= prev_week_start) & (fdf["date_only"] <= prev_week_end)]
+        elif option_periode == "Choisir une semaine":
+            fdf = fdf[(fdf["date_only"] >= chosen_week_start) & (fdf["date_only"] <= chosen_week_end)]
         if selected_agence != "Toutes":
             fdf = fdf[fdf["agence"] == selected_agence]
         if selected_code != "Tous":
             fdf = fdf[fdf["code_parrainage"] == selected_code]
 
         st.markdown("# ⚙️ Vue Système J+1 — Mansa Bank")
+        periode_txt = option_periode if option_periode != "Choisir une semaine" else chosen_label
         st.caption(
-            f"Filtrage actif : **{option_periode}**"
+            f"Filtrage actif : **{periode_txt}**"
             + (f" · Agence : **{selected_agence}**" if selected_agence != "Toutes" else "")
             + (f" · Code : **{selected_code}**" if selected_code != "Tous" else "")
         )
@@ -298,8 +334,8 @@ def _render_dashboard():
 
         if not base_avd["ok"]:
             st.info(
-                f"ℹ️ Fichier de base introuvable ou colonne code non détectée ({BASE_XLSX_URL or BASE_XLSX_PATH}). "
-                "Placez-le à côté du script, renseignez BASE_XLSX_URL, ou vérifiez BASE_CODE_KEYWORDS."
+                f"ℹ️ Base agents introuvable ou colonne code non détectée (Sheet gid={BASE_SHEET_GID}). "
+                "Vérifiez que le Sheet est partagé en lecture publique et que BASE_CODE_KEYWORDS correspond à vos colonnes."
             )
         elif nb_non_enrolles > 0:
             st.markdown(
@@ -345,14 +381,28 @@ def _render_dashboard():
                     agent_summary["% de l'équipe"] = ((agent_summary["Activations"] / team_activations) * 100).round(1).astype(str) + " %"
                 else:
                     agent_summary["% de l'équipe"] = "0.0 %"
+                agent_summary["Acquisition (Wallet 1 & 2)"] = (
+                    "Wallet 1 : " + agent_summary["Wallet_1"].astype(str) + "  ·  Wallet 2 : " + agent_summary["Wallet_2"].astype(str)
+                )
+                agent_summary = agent_summary.drop(columns=["Wallet_1", "Wallet_2"])
                 agent_summary = agent_summary.sort_values("Activations", ascending=False)
 
                 st.dataframe(
-                    agent_summary.rename(columns={"code_parrainage": "Code agent", "parrain_nom": "Nom & Prénoms", "Wallet_1": "Wallet 1", "Wallet_2": "Wallet 2"}),
+                    agent_summary.rename(columns={"code_parrainage": "Code agent", "parrain_nom": "Nom & Prénoms"}),
                     use_container_width=True,
                     hide_index=True,
                 )
                 st.markdown("<br>", unsafe_allow_html=True)
+
+        st.markdown("<h3 class='section-title'>📋 Détail complet — toutes les lignes (sans exception)</h3>", unsafe_allow_html=True)
+        st.caption("Chaque filleul du fichier Brut sur la période sélectionnée, y compris les activations à 0/FALSE.")
+        detail_df = fdf[["agence", "code_parrainage", "parrain_nom", "filleul_nom", "acquisition", "is_true", "date_only"]].copy()
+        detail_df["is_true"] = detail_df["is_true"].map({True: "Oui", False: "Non"})
+        detail_df = detail_df.rename(columns={
+            "agence": "Agence", "code_parrainage": "Code agent", "parrain_nom": "Nom & Prénoms",
+            "filleul_nom": "Filleul", "acquisition": "Acquisition", "is_true": "Activation", "date_only": "Date parrainage",
+        })
+        st.dataframe(detail_df, use_container_width=True, hide_index=True, height=420)
 
         st.markdown("<h3 class='section-title'>📥 Export</h3>", unsafe_allow_html=True)
         with st.expander("Télécharger les données filtrées"):
