@@ -1,8 +1,8 @@
 """
 Vue Système J+1 — Mansa Bank
 ============================
-Source des activations : Google Sheets (onglet "Brut"), alimenté automatiquement par mail.
-Source de l'effectif AVD (Prévu) : Google Sheet "base agents activateurs" DataSurvey Africa.
+Source des activations : Google Sheets (onglet "Brut"), alimenté automatiquement par le pipeline
+mail → Apps Script → Sheet. C'est l'unique source de données de ce dashboard.
 
 CONÇU POUR 100+ UTILISATEURS SIMULTANÉS :
 - Toutes les requêtes réseau passent par un cache PARTAGÉ (st.cache_data) : le Sheet
@@ -39,19 +39,6 @@ BRUT_TTL = 90  # secondes — fraîcheur des activations
 FETCH_TIMEOUT = 15  # secondes — au-delà, on abandonne cette tentative
 FETCH_RETRIES = 3
 
-# --- Base agents activateurs (AVD Prévu) — Google Sheet ---
-# Colonnes confirmées : date_soumission, start, end, code parrainage, numero the code,
-# nom et prenoms, role (commercial/superviseur), nom du superviseur, regions, ville, equipe.
-# On ne garde que role="commercial" (les vrais AVD terrain, pas les superviseurs).
-BASE_SHEET_ID = "1968llx0L-Eu-TSKfJKweFbfzag_i5a7SsSBWoB9I6Zc"
-BASE_SHEET_GID = "1616384377"
-BASE_CSV_URL = f"https://docs.google.com/spreadsheets/d/{BASE_SHEET_ID}/gviz/tq?tqx=out:csv&gid={BASE_SHEET_GID}"
-BASE_TTL = 3600
-
-BASE_CODE_KEYWORDS = ["code"]  # capte "code parrainage" (1ère colonne "code" du fichier)
-BASE_ROLE_KEYWORDS = ["role"]
-BASE_ROLE_FILTER = "commercial"  # ne compter que les AVD terrain, pas les superviseurs
-
 # --- Définition des "semaines" (cycle dynamique, ne nécessite aucune maintenance) ---
 FIRST_WEEK_START = date(2026, 8, 15)
 FIRST_WEEK_END = date(2026, 8, 23)
@@ -64,11 +51,6 @@ def get_week_bounds(ref_date: date) -> tuple[date, date]:
     offset_weeks = (ref_date - REGULAR_WEEK_START).days // 7
     start = REGULAR_WEEK_START + timedelta(days=offset_weeks * 7)
     return start, start + timedelta(days=6)
-
-
-def get_previous_week_bounds(ref_date: date) -> tuple[date, date]:
-    this_start, _ = get_week_bounds(ref_date)
-    return get_week_bounds(this_start - timedelta(days=1))
 
 
 def get_all_weeks(ref_date: date) -> list[tuple[str, date, date]]:
@@ -160,15 +142,19 @@ def load_and_process_brut() -> pd.DataFrame:
     df["code_parrainage"] = df.get("code_parrainage", pd.Series(dtype=str)).fillna("Inconnu").astype(str).str.strip().str.upper()
     df["parrain_nom"] = df.get("parrain_nom", pd.Series(dtype=str)).fillna("Non renseigné").astype(str).str.strip()
 
-    df["date_parrainage_parsed"] = pd.to_datetime(df.get("date_parrainage"), errors="coerce", dayfirst=True)
+    # Parsing de date robuste : certaines lignes ajoutées automatiquement (Apps Script) peuvent
+    # sortir dans un format différent des saisies manuelles. On tente jour-premier puis mois-premier
+    # et on comble les trous de l'un avec l'autre, ligne par ligne.
+    raw_dates = df.get("date_parrainage", pd.Series(dtype=str)).astype(str).str.strip()
+    parsed_dayfirst = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
+    parsed_monthfirst = pd.to_datetime(raw_dates, errors="coerce", dayfirst=False)
+    df["date_parrainage_parsed"] = parsed_dayfirst.fillna(parsed_monthfirst)
     df["date_only"] = df["date_parrainage_parsed"].dt.date
 
     df["is_true"] = df.get("a_transacte", pd.Series(dtype=str)).astype(str).str.strip().str.lower().eq("true")
 
     wallet_raw = df.get("wallet", pd.Series(dtype=str)).astype(str).str.upper()
     df["acquisition"] = wallet_raw.apply(lambda v: "Wallet 2" if "2" in v else ("Wallet 1" if "1" in v else "Autre"))
-    df["wallet1_true"] = df["is_true"] & (df["acquisition"] == "Wallet 1")
-    df["wallet2_true"] = df["is_true"] & (df["acquisition"] == "Wallet 2")
     # Comptage brut par wallet — simple décompte de la colonne acquisition, sans condition sur a_transacte
     df["is_wallet1"] = df["acquisition"] == "Wallet 1"
     df["is_wallet2"] = df["acquisition"] == "Wallet 2"
@@ -177,42 +163,6 @@ def load_and_process_brut() -> pd.DataFrame:
     store.last_success = datetime.now(timezone.utc)
     store.last_error = None
     return df
-
-
-# ============================================================================
-# CHARGEMENT — BASE AVD (Prévu / Déployé)
-# ============================================================================
-
-
-def _find_col(columns, keywords):
-    for c in columns:
-        if any(k in str(c).lower() for k in keywords):
-            return c
-    return None
-
-
-@st.cache_data(ttl=BASE_TTL, show_spinner=False)
-def load_base_avd() -> dict:
-    """AVD Prévu = tous les agents de la base. AVD Déployé = ceux, parmi eux, qui ont
-    fait au moins une activation sur la période sélectionnée (calculé plus loin)."""
-    try:
-        base_df = _fetch_csv_with_retries(BASE_CSV_URL)
-    except Exception:
-        return {"codes": set(), "ok": False}
-
-    base_df.columns = [str(c).strip() for c in base_df.columns]
-    code_col = _find_col(base_df.columns, BASE_CODE_KEYWORDS)
-    if not code_col:
-        return {"codes": set(), "ok": False}
-
-    role_col = _find_col(base_df.columns, BASE_ROLE_KEYWORDS)
-    if role_col:
-        role_norm = base_df[role_col].astype(str).str.strip().str.lower()
-        base_df = base_df[role_norm.str.contains(BASE_ROLE_FILTER, na=False)]
-
-    codes = set(base_df[code_col].dropna().astype(str).str.strip().str.upper())
-    codes.discard("")
-    return {"codes": codes, "ok": True}
 
 
 # ============================================================================
@@ -239,25 +189,28 @@ def _render_dashboard():
                 unsafe_allow_html=True,
             )
 
-        base_avd = load_base_avd()
-
         today_utc = datetime.now(timezone.utc).date()
         yesterday_utc = today_utc - timedelta(days=1)
         week_start, week_end = get_week_bounds(today_utc)
-        prev_week_start, prev_week_end = get_previous_week_bounds(today_utc)
         all_weeks = get_all_weeks(today_utc)  # [(label, début, fin), ...] Semaine 1 → semaine en cours
+
+        # Diagnostic de fraîcheur : dernière date de parrainage réellement présente dans le fichier,
+        # et nombre de lignes dont la date n'a pas pu être comprise (utile pour repérer un souci
+        # de format venant de l'automatisation mail → Apps Script → Sheet).
+        valid_dates = df["date_only"].dropna()
+        max_date_in_data = valid_dates.max() if not valid_dates.empty else None
+        nb_dates_invalides = int(df["date_only"].isna().sum())
 
         with st.sidebar:
             st.markdown("### ⚡ Filtres")
             option_periode = st.radio(
                 "Période (basée sur la date de parrainage) :",
-                options=["Hier", "Cette semaine", "Semaine passée", "Choisir une semaine"],
+                options=["Hier", "Cette semaine", "Choisir une semaine"],
                 index=0,
                 key="option_periode",
             )
             st.caption(f"Hier : {yesterday_utc:%d/%m}")
             st.caption(f"Cette semaine : {week_start:%d/%m} → {week_end:%d/%m}")
-            st.caption(f"Semaine passée : {prev_week_start:%d/%m} → {prev_week_end:%d/%m}")
 
             chosen_week_start, chosen_week_end = week_start, week_end
             if option_periode == "Choisir une semaine":
@@ -279,14 +232,16 @@ def _render_dashboard():
                 st.rerun()
             if store.last_success:
                 st.caption(f"Dernière synchro : {store.last_success:%d/%m %H:%M} UTC")
+            if max_date_in_data:
+                st.caption(f"Dernière date de parrainage dans le fichier : {max_date_in_data:%d/%m/%Y}")
+            if nb_dates_invalides:
+                st.caption(f"⚠️ {nb_dates_invalides} ligne(s) avec une date illisible")
 
         fdf = df
         if option_periode == "Hier":
             fdf = fdf[fdf["date_only"] == yesterday_utc]
         elif option_periode == "Cette semaine":
             fdf = fdf[(fdf["date_only"] >= week_start) & (fdf["date_only"] <= week_end)]
-        elif option_periode == "Semaine passée":
-            fdf = fdf[(fdf["date_only"] >= prev_week_start) & (fdf["date_only"] <= prev_week_end)]
         elif option_periode == "Choisir une semaine":
             fdf = fdf[(fdf["date_only"] >= chosen_week_start) & (fdf["date_only"] <= chosen_week_end)]
         if selected_agence != "Toutes":
@@ -303,15 +258,6 @@ def _render_dashboard():
         )
 
         activations_periode = int(fdf["is_true"].sum())
-        codes_actifs_periode = set(fdf.loc[fdf["is_true"], "code_parrainage"].unique())
-        avd_actifs = len(codes_actifs_periode)
-
-        if base_avd["ok"]:
-            avd_prevu = len(base_avd["codes"])
-            avd_deploye = len(codes_actifs_periode & base_avd["codes"])
-            nb_non_enrolles = len(codes_actifs_periode - base_avd["codes"])
-        else:
-            avd_prevu, avd_deploye, nb_non_enrolles = "—", "—", 0
 
         if activations_periode > 0:
             best_agence = fdf.groupby("agence")["is_true"].sum().idxmax()
@@ -320,27 +266,17 @@ def _render_dashboard():
         else:
             best_agence, best_agent = "—", "—"
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("AVD PRÉVU (base)", avd_prevu, help="Nombre total d'agents enregistrés dans la base DataSurvey Africa.")
-        c2.metric("AVD DÉPLOYÉ", avd_deploye, help="Agents de la base ayant fait au moins 1 activation sur la période.")
-        c3.metric("AVD ACTIF (toutes origines)", avd_actifs, help="Tout code ayant fait ≥1 activation sur la période, base ou non.")
-        c4.metric("ACTIVATIONS (période)", activations_periode)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("ACTIVATIONS (période)", activations_periode)
+        c2.metric("MEILLEURE ÉQUIPE", best_agence)
+        c3.metric("MEILLEUR AGENT", best_agent)
+        c4.metric("ACQUISITION WALLET 1", int(fdf["is_wallet1"].sum()))
+        c5.metric("ACQUISITION WALLET 2", int(fdf["is_wallet2"].sum()))
 
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("MEILLEURE ÉQUIPE", best_agence)
-        c6.metric("MEILLEUR AGENT", best_agent)
-        c7.metric("ACQUISITION WALLET 1", int(fdf["is_wallet1"].sum()))
-        c8.metric("ACQUISITION WALLET 2", int(fdf["is_wallet2"].sum()))
-
-        if not base_avd["ok"]:
-            st.info(
-                f"ℹ️ Base agents introuvable ou colonne code non détectée (Sheet gid={BASE_SHEET_GID}). "
-                "Vérifiez que le Sheet est partagé en lecture publique et que BASE_CODE_KEYWORDS correspond à vos colonnes."
-            )
-        elif nb_non_enrolles > 0:
+        if fdf.empty and max_date_in_data and max_date_in_data >= week_start:
             st.markdown(
-                f"<div class='stale-banner'>⚠️ {nb_non_enrolles} code(s) actif(s) sur la période ne figurent pas "
-                "dans la base d'agents — à vérifier avec les superviseurs.</div>",
+                "<div class='stale-banner'>ℹ️ La période sélectionnée ne contient aucune ligne, alors que le fichier "
+                f"contient des données jusqu'au {max_date_in_data:%d/%m/%Y}. Vérifiez le filtre choisi ci-contre.</div>",
                 unsafe_allow_html=True,
             )
 
